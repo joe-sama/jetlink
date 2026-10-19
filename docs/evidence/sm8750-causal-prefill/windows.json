@@ -1,0 +1,312 @@
+{
+  "windows": [
+    {
+      "start_second": 0,
+      "p99_ms": 29.1,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 10,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 20,
+      "p99_ms": 29.8,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 30,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 40,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 50,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 60,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 70,
+      "p99_ms": 29.1,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 80,
+      "p99_ms": 29.1,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 90,
+      "p99_ms": 29.0,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 100,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 110,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 120,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 130,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 140,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 150,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 160,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 170,
+      "p99_ms": 29.7,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 180,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 190,
+      "p99_ms": 29.1,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 200,
+      "p99_ms": 29.0,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 210,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 220,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 230,
+      "p99_ms": 29.7,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 240,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 250,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 260,
+      "p99_ms": 30.8,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 270,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 280,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 290,
+      "p99_ms": 29.0,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 300,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 310,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 320,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 330,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 340,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 350,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 360,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 370,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 380,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 390,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 400,
+      "p99_ms": 29.9,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 410,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 420,
+      "p99_ms": 29.7,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 430,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 440,
+      "p99_ms": 29.9,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 450,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 460,
+      "p99_ms": 29.3,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 470,
+      "p99_ms": 29.1,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 480,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 490,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 500,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 510,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 520,
+      "p99_ms": 29.6,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 530,
+      "p99_ms": 30.0,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 540,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 550,
+      "p99_ms": 29.2,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 560,
+      "p99_ms": 29.5,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 570,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 580,
+      "p99_ms": 29.4,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 590,
+      "p99_ms": 29.7,
+      "thermal": "Normal"
+    },
+    {
+      "start_second": 600,
+      "p99_ms": 27.1,
+      "thermal": "Normal"
+    }
+  ],
+  "all_normal": true,
+  "min_window_p99_ms": 27.1,
+  "max_window_p99_ms": 30.8
+}
