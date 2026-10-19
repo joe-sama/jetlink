@@ -22,6 +22,26 @@ val jetlinkVersionCode: Int =
     jetlinkVersion.split(".").map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
         .let { (it.getOrElse(0) { 0 } * 10000) + (it.getOrElse(1) { 0 } * 100) + it.getOrElse(2) { 0 } }
 
+// Explicit build opt-in: standard releases still package the Maven QNN runtime.
+val causalPrefill = providers.gradleProperty("jetlink.causalPrefill").orNull == "true"
+val qairtJniDir = providers.gradleProperty("jetlink.qairtJniDir").orNull
+if (causalPrefill) {
+    check(qairtJniDir != null) { "causal-prefill needs the matched QAIRT 2.47 jniLibs; see docs/android-causal-prefill.md" }
+    @Suppress("UNCHECKED_CAST")
+    val matched = groovy.json.JsonSlurper().parse(rootDir.resolve("qnn/qairt-2.47-sha256.json")) as Map<String, String>
+    for ((name, expected) in matched) {
+        val library = File(qairtJniDir, "arm64-v8a/$name")
+        check(library.isFile) { "missing QAIRT 2.47 library: $name" }
+        val actual = MessageDigest.getInstance("SHA-256").digest(library.readBytes()).joinToString("") { "%02x".format(it) }
+        check(actual == expected) { "$name differs from the validated QAIRT 2.47 stack" }
+    }
+    for (name in listOf("libJetlinkQnnHtp.so", "libQnnHtp.so", "libQnnGpu.so", "libQnnHtpV79Stub.so", "libQnnHtpV79Skel.so")) {
+        check(File(qairtJniDir, "arm64-v8a/$name").isFile) { "missing matched library: $name" }
+    }
+} else {
+    check(qairtJniDir == null) { "jetlink.qairtJniDir is only supported with jetlink.causalPrefill=true" }
+}
+
 android {
     namespace = "io.zoompilot.jetlink"
     compileSdk = 37
@@ -36,6 +56,7 @@ android {
         targetSdk = 36
         versionCode = jetlinkVersionCode
         versionName = jetlinkVersion
+        buildConfigField("boolean", "EXPERIMENTAL_CAUSAL_PREFILL", causalPrefill.toString())
         // The QNN runtime is arm64 only, and so is every Snapdragon with an NPU
         // worth driving on. The emulator on an Apple silicon Mac is arm64 too.
         ndk { abiFilters += "arm64-v8a" }
@@ -83,6 +104,8 @@ android {
             excludes += "**/libonnxruntime4j_jni.so"
         }
     }
+
+    if (causalPrefill) sourceSets.getByName("main").jniLibs.srcDir(qairtJniDir!!)
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -132,7 +155,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     // libonnxruntime.so with the QNN provider, and the QNN runtime's libraries
-    implementation(libs.onnxruntime.qnn)
+    implementation(libs.onnxruntime.qnn) {
+        if (causalPrefill) exclude(group = "com.qualcomm.qti", module = "qnn-runtime")
+    }
     debugImplementation(libs.compose.ui.tooling)
 
     onnxruntimeAar(variantOf(libs.onnxruntime.qnn) { artifactType("aar") })
