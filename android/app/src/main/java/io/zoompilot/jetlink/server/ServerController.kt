@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import io.zoompilot.jetlink.settings.Chip
+import io.zoompilot.jetlink.settings.Processor
 import io.zoompilot.jetlink.settings.SettingsValues
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -99,6 +100,12 @@ class ServerController(private val context: Context, private val scope: Coroutin
         // a model compiled for the NPU is good for this system build alone
         put("firmware", Build.FINGERPRINT)
         put("native_library_dir", context.applicationInfo.nativeLibraryDir)
+        if (processor == Processor.NpuGpuParallel) {
+            context.getExternalFilesDir(null)?.let { directory ->
+                put("parallel_bundle", File(directory, "causal-prefill-v1").absolutePath)
+                if (settings.developer) put("parallel_trace_path", File(directory, "parallel-stages.json").absolutePath)
+            }
+        }
     }
 
     /** Follows the snapshot and the log for as long as the app runs. */
