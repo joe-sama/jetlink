@@ -21,6 +21,15 @@ class ProcessorTest {
     }
 
     @Test
+    fun parallelNeedsExplicitOptIn() {
+        assertFalse(Processor.NpuGpuParallel in Processor.choices(true, false, false, Processor.Auto))
+        assertTrue(Processor.NpuGpuParallel in Processor.choices(true, false, false, Processor.Auto, parallel = true))
+        assertFalse(Processor.NpuGpuParallel in Processor.choices(false, true, false, Processor.Auto, parallel = true))
+        assertEquals(Processor.NpuGpuParallel, Processor.of("htp-parallel"))
+        assertEquals(Processor.NpuGpu, Processor.of("htp"))
+    }
+
+    @Test
     fun aGoogleTensorOffersItsNpu() {
         assertEquals(
             listOf(Processor.Auto, Processor.TensorNpu, Processor.Gpu, Processor.Cpu),
@@ -69,9 +78,9 @@ class ProcessorTest {
 
     @Test
     fun onlyOnnxruntimesNpuAndGpuChoicesNeedQnn() {
-        assertEquals(listOf(Processor.Npu, Processor.NpuGpu), Processor.entries.filter { it.usesQnn })
+        assertEquals(listOf(Processor.Npu, Processor.NpuGpu, Processor.NpuGpuParallel), Processor.entries.filter { it.usesQnn })
         assertEquals(
-            listOf(Backend.Ort, Backend.LiteRt, Backend.LiteRt, Backend.Ort, Backend.Ort),
+            listOf(Backend.Ort, Backend.LiteRt, Backend.LiteRt, Backend.Ort, Backend.Ort, Backend.Ort),
             Processor.entries.filter { it != Processor.Auto }.map { it.backend },
         )
     }
