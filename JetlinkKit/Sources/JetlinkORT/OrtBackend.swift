@@ -25,6 +25,8 @@ public enum OrtProfile: String, CaseIterable, Sendable {
   /// fp16 whatever the graph says, so its fp32 heads are fp16 there too, and
   /// only the parity check can say whether that is close enough.
   case htpWhole = "htp-whole"
+  /// Experimental same-frame (HTP vision || GPU history) -> HTP decode -> CPU join.
+  case htpParallel = "htp-parallel"
   /// The whole graph on the Adreno GPU.
   case gpu
   /// onnxruntime's CPU provider alone: for tests, the emulator and Linux,
@@ -36,7 +38,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
     #if canImport(Metal)
       [.ane, .aneWhole, .coreml, .cpu]
     #elseif os(Android)
-      [.htp, .htpWhole, .gpu, .cpu]
+      [.htp, .htpWhole, .htpParallel, .gpu, .cpu]
     #else
       [.cpu]
     #endif
@@ -50,6 +52,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
     case .aneWhole: [("model", .coreML("ALL"))]
     case .htp: [("vision", .htp), ("policy", .qnnGPU)]
     case .htpWhole: [("model", .htp)]
+    case .htpParallel: [("vision", .htp), ("history", .qnnGPU), ("decode", .htp), ("join", .cpu)]
     case .gpu: [("model", .qnnGPU)]
     case .cpu: [("model", .cpu)]
     }
@@ -64,6 +67,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
     switch self {
     case .ane, .htp: .split
     case .aneWhole, .htpWhole: .aneWhole
+    case .htpParallel: .qnnPrefillBase  // loaded from the verified offline bundle
     case .coreml, .gpu: .whole
     case .cpu:
       #if os(Android)
@@ -77,7 +81,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
   /// What a build writes: 5 is every graph split on `ane` and Expand as Tile
   /// on both, 6 the plain graph. An artifact prepared under another rebuilds.
   public var prepareVersion: Int {
-    layout == .plain ? 6 : 5
+    self == .htpParallel ? 10 : (layout == .plain ? 6 : 5)
   }
 
   var usesCoreML: Bool {
@@ -122,8 +126,8 @@ enum OrtUnit: Equatable {
 /// and their manifest (OrtArtifact), CoreML's compiled models or QNN's EP
 /// context beside them.
 ///
-/// Nothing QNN has run on a Snapdragon yet: its options follow onnxruntime
-/// 1.29's QNN documentation and source.
+/// The causal-prefill profile has been measured on SM8750 with Cinque V3;
+/// other QNN profiles and hardware keep their existing behavior.
 public final class OrtBackend: EngineBackend {
   /// A first NPU compile with no earlier build to go by. The QNN graph
   /// finalization of a big model is minutes on a phone (unmeasured).
@@ -156,7 +160,11 @@ public final class OrtBackend: EngineBackend {
   public var runtimeVersion: String { OrtRuntime.version }
 
   public func deviceTag() -> String {
-    sanitize("\(profile.rawValue)-\(chip)")
+    if profile == .htpParallel {
+      let mode = ProcessInfo.processInfo.environment["JETLINK_PARALLEL_SERIAL"] == "1" ? "serial" : "parallel"
+      return sanitize("htp-parallel-\(chip)-fused4-qairt247-no-fusion-sharedio-\(CausalPrefillBundle.identity)-\(mode)")
+    }
+    return sanitize("\(profile.rawValue)-\(chip)")
   }
 
   public func deriveSpec(model: URL, sha256: String, nbytes: Int64, frameSkip: Int) throws -> ModelSpec {
@@ -165,7 +173,16 @@ public final class OrtBackend: EngineBackend {
 
   /// QNN's options for a unit, as onnxruntime 1.29 names them.
   func providerOptions(_ unit: OrtUnit) -> [String: String] {
-    switch unit {
+    if profile == .htpParallel && unit == .htp {
+      return [
+        "backend_path": (ProcessInfo.processInfo.environment["JETLINK_QNN_LIBRARY_DIR"].map { "\($0)/" } ?? "") + "libJetlinkQnnHtp.so",
+        "soc_model": "69", "htp_arch": "79",
+        "htp_performance_mode": keepAlive ? "burst" : "sustained_high_performance",
+        "htp_graph_finalization_optimization_mode": "3", "enable_htp_fp16_precision": "1",
+        "qnn_context_priority": "high", "enable_htp_shared_memory_allocator": "1",
+      ]
+    }
+    return switch unit {
     case .htp:
       [
         "backend_type": "htp",
@@ -201,16 +218,40 @@ public final class OrtBackend: EngineBackend {
     }
   }
 
+  /// Fail before compiling or loading on unvalidated hardware/runtime stacks.
+  private func validateParallel() throws {
+    guard profile == .htpParallel else { return }
+    guard chip == "SM8750", OrtRuntime.version == "1.29.0",
+      ProcessInfo.processInfo.environment["JETLINK_QNN_TUNING"] == "no-fusion",
+      ProcessInfo.processInfo.environment["JETLINK_QNN_STRICT"] == "1"
+    else {
+      throw HostError.invalid("causal-prefill requires the opt-in SM8750 / ORT 1.29 / QAIRT 2.47 build; see docs/android-causal-prefill.md")
+    }
+  }
+
+  private func engine(_ artifact: URL, _ manifest: [[String: Any]], keepAlive: Bool, keepCPUWarm: Bool) throws -> OrtEngine {
+    try OrtEngine(
+      plans: plans(artifact, manifest), device: deviceTag(), keepAlive: keepAlive, keepCPUWarm: keepCPUWarm,
+      dataflow: profile == .htpParallel,
+      parallel: ProcessInfo.processInfo.environment["JETLINK_PARALLEL_SERIAL"] != "1")
+  }
+
   // MARK: build
 
   public func build(model: URL, artifact: URL, report: @escaping ProgressFn, metaExtra: [String: Any]) throws {
+    try validateParallel()
     let started = Date()
     let expect = Artifact.sidecar(artifact)
     try Artifact.build(artifact, metaExtra: metaExtra, report: report) { staged in
       try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
       report("patch", 0, profile.usesCoreML ? "preparing the model for CoreML" : "preparing the model")
-      let prepared = try preparer.prepare(model: model, into: staged, layout: profile.layout) {
-        CoreMLPreparation.cacheKey(stem: artifact.deletingPathExtension().lastPathComponent, part: $0)
+      let prepared: PreparedModel
+      if profile == .htpParallel {
+        prepared = try CausalPrefillBundle.prepare(model: model, into: staged)
+      } else {
+        prepared = try preparer.prepare(model: model, into: staged, layout: profile.layout) {
+          CoreMLPreparation.cacheKey(stem: artifact.deletingPathExtension().lastPathComponent, part: $0)
+        }
       }
       log.info("prepared \(model.lastPathComponent): \(prepared.summary)")
       let sessions = profile.sessions
@@ -247,7 +288,7 @@ public final class OrtBackend: EngineBackend {
       }
       // Prove it runs before calling it built: minutes on a CPU, so it ticks.
       let providers = try Ticker.during(interval: 1, Ticker.paced("load", "loading the model to check it runs", took: 0, report: report)) {
-        let engine = try OrtEngine(plans: plans(staged, manifest), device: deviceTag(), keepAlive: false, keepCPUWarm: false)
+        let engine = try self.engine(staged, manifest, keepAlive: false, keepCPUWarm: false)
         defer { engine.close() }
         try engine.run()
         return engine.providers
@@ -297,7 +338,7 @@ public final class OrtBackend: EngineBackend {
       report(stage, frac, msg)
     }
     let engine = try Ticker.during(interval: 2, tick) {
-      try OrtEngine(plans: plans(staged, manifest), device: deviceTag(), keepAlive: false, keepCPUWarm: false)
+      try self.engine(staged, manifest, keepAlive: false, keepCPUWarm: false)
     }
     defer { engine.close() }
     let (converted, compiled) = progress.measure()
@@ -326,6 +367,7 @@ public final class OrtBackend: EngineBackend {
   // MARK: load
 
   public func load(artifact: URL, report: @escaping ProgressFn) throws -> any Engine {
+    try validateParallel()
     let (manifest, meta) = try OrtArtifact.open(artifact, version: profile.prepareVersion) { entry in
       guard let unit = OrtUnit(entry: entry) else { return "a session names no unit" }
       // Without its compile, onnxruntime would recompile under a "loading"
@@ -338,7 +380,7 @@ public final class OrtBackend: EngineBackend {
     }
     let what = profile.usesCoreML ? "the CoreML model" : "the model"
     let (engine, seconds) = try Artifact.load(artifact, meta: meta, what: what, report: report) {
-      try OrtEngine(plans: plans(artifact, manifest), device: deviceTag(), keepAlive: keepAlive, keepCPUWarm: keepCPUWarm)
+      try self.engine(artifact, manifest, keepAlive: keepAlive, keepCPUWarm: keepCPUWarm)
     }
     log.info("onnxruntime sessions on \(profile.rawValue) in \(String(format: "%.1f", seconds)) s: \(engine.providers.joined(separator: " then "))")
     return engine
