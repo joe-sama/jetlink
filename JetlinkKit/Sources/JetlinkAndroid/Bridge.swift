@@ -174,6 +174,23 @@
       guard let cache = config["cache"] as? String, !cache.isEmpty else {
         throw HostFailure("no cache directory")
       }
+      let parallel = config["device"] as? String == "htp-parallel"
+      setenv("JETLINK_QNN_TUNING", parallel ? "no-fusion" : "stock", 1)
+      if parallel { setenv("JETLINK_QNN_STRICT", "1", 1) } else { unsetenv("JETLINK_QNN_STRICT") }
+      setenv("JETLINK_PARALLEL_SERIAL", (config["parallel_serial"] as? Bool) == true ? "1" : "0", 1)
+      if let path = config["parallel_bundle"] as? String, parallel {
+        setenv("JETLINK_PREFILL_BUNDLE", path, 1)
+      } else {
+        unsetenv("JETLINK_PREFILL_BUNDLE")
+      }
+      if let path = config["parallel_trace_path"] as? String, parallel {
+        setenv("JETLINK_PARALLEL_TRACE", path, 1)
+      } else {
+        unsetenv("JETLINK_PARALLEL_TRACE")
+      }
+      if let dir = config["native_library_dir"] as? String {
+        setenv("JETLINK_QNN_LIBRARY_DIR", dir, 1)
+      }
       let backend = try Host.backend(config)
       let configuration = Server.Configuration(
         port: UInt16(clamping: (config["port"] as? NSNumber)?.intValue ?? Int(Wire.defaultPort)),
