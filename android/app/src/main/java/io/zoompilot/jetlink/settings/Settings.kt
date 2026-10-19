@@ -44,6 +44,9 @@ enum class Processor(val backend: Backend, val device: String, val title: String
      */
     NpuGpu(Backend.Ort, "htp", "NPU + GPU"),
 
+    /** Same-frame history/vision overlap; only in the explicitly enabled SM8750 build. */
+    NpuGpuParallel(Backend.Ort, "htp-parallel", "NPU + GPU (experimental)"),
+
     /** The CPU: the emulator and tests. Seconds a frame with a real model. */
     Cpu(Backend.Ort, "cpu", "CPU");
 
@@ -88,9 +91,9 @@ enum class Processor(val backend: Backend, val device: String, val title: String
          * CPU is offered on a Snapdragon only once chosen; the emulator offers
          * everything, for testing.
          */
-        fun choices(qualcomm: Boolean, tensorNpu: Boolean, emulator: Boolean, current: Processor): List<Processor> = when {
+        fun choices(qualcomm: Boolean, tensorNpu: Boolean, emulator: Boolean, current: Processor, parallel: Boolean = false): List<Processor> = when {
             emulator -> entries
-            qualcomm -> entries.filter { it != TensorNpu && (it != Cpu || current == Cpu) }
+            qualcomm -> entries.filter { it != TensorNpu && (it != Cpu || current == Cpu) && (it != NpuGpuParallel || parallel) }
             tensorNpu -> listOf(Auto, TensorNpu, Gpu, Cpu)
             else -> listOf(Auto, Gpu, Cpu)
         }
