@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <onnxruntime/onnxruntime_c_api.h>
 
@@ -15,6 +16,7 @@ struct jl_env {
 
 struct jl_session {
   OrtSession *session;
+  int profiling;
 };
 
 struct jl_binding {
@@ -22,6 +24,13 @@ struct jl_binding {
   OrtIoBinding *binding;
   OrtValue **values;
   size_t n_values;
+};
+
+struct jl_shared_allocator {
+  OrtSession *session;
+  OrtAllocator *allocator;
+  OrtMemoryInfo *memory;
+  size_t total_bytes;
 };
 
 #ifdef JL_ORT_DLOPEN
@@ -157,6 +166,23 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
   for (size_t i = 0; error == NULL && i < n_config; i++) {
     error = take(api()->AddSessionConfigEntry(so, config[i].key, config[i].value));
   }
+  const char *profile = getenv("JETLINK_ORT_PROFILE");
+  if (error == NULL && profile != NULL && profile[0] != '\0') {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s-ort-%p", profile, (void *)so);
+    error = take(api()->EnableProfiling(so, path));
+  }
+  if (error == NULL && provider != NULL && strcmp(provider, "QNN") == 0 && getenv("JETLINK_QNN_STRICT") != NULL) {
+    for (size_t i = 0; i < n_options; i++) {
+      if ((strcmp(options[i].key, "backend_type") == 0 &&
+           (strcmp(options[i].value, "htp") == 0 || strcmp(options[i].value, "gpu") == 0)) ||
+          (strcmp(options[i].key, "backend_path") == 0 && strstr(options[i].value, "libJetlinkQnnHtp.so") != NULL)) {
+        // A heterogeneous test must fail if either accelerator leaves compute on the CPU.
+        error = take(api()->AddSessionConfigEntry(so, "session.disable_cpu_ep_fallback", "1"));
+        break;
+      }
+    }
+  }
   if (error == NULL && provider != NULL) {
     const char **keys = calloc(n_options + 1, sizeof(char *));
     const char **values = calloc(n_options + 1, sizeof(char *));
@@ -181,6 +207,7 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
   }
   if (error == NULL) {
     error = take(api()->CreateSession(env->env, model_path, so, &session->session));
+    session->profiling = profile != NULL && profile[0] != '\0';
   }
   api()->ReleaseSessionOptions(so);
   if (error != NULL) {
@@ -194,6 +221,19 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
 void jl_session_release(jl_session *session) {
   if (session == NULL) {
     return;
+  }
+  if (session->profiling) {
+    OrtAllocator *allocator = NULL;
+    char *filename = NULL;
+    OrtStatus *status = api()->GetAllocatorWithDefaultOptions(&allocator);
+    if (status == NULL) {
+      free(take(api()->SessionEndProfiling(session->session, allocator, &filename)));
+      if (filename != NULL) {
+        free(take(api()->AllocatorFree(allocator, filename)));
+      }
+    } else {
+      free(take(status));
+    }
   }
   api()->ReleaseSession(session->session);
   free(session);
@@ -274,14 +314,76 @@ void jl_binding_release(jl_binding *binding) {
   free(binding);
 }
 
+void jl_shared_allocator_release(jl_shared_allocator *allocator) {
+  if (allocator == NULL) return;
+  if (allocator->allocator != NULL) api()->ReleaseAllocator(allocator->allocator);
+  if (allocator->memory != NULL) api()->ReleaseMemoryInfo(allocator->memory);
+  free(allocator);
+}
+
+char *jl_shared_allocator_create(jl_session *session, jl_shared_allocator **out) {
+  if (session == NULL || out == NULL) return copy("shared allocator needs a session and output");
+  *out = NULL;
+  jl_shared_allocator *allocator = calloc(1, sizeof(*allocator));
+  if (allocator == NULL) return copy("out of memory");
+  allocator->session = session->session;
+  char *error = take(api()->CreateMemoryInfo("QnnHtpShared", OrtDeviceAllocator, 0,
+                                             OrtMemTypeDefault, &allocator->memory));
+  if (error == NULL) error = take(api()->CreateAllocator(session->session, allocator->memory, &allocator->allocator));
+  const OrtMemoryInfo *actual = NULL;
+  if (error == NULL) error = take(api()->AllocatorGetInfo(allocator->allocator, &actual));
+  int different = 1;
+  if (error == NULL) error = take(api()->CompareMemoryInfo(allocator->memory, actual, &different));
+  if (error == NULL && different != 0) error = copy("session did not return QNN shared memory");
+  if (error != NULL) {
+    jl_shared_allocator_release(allocator);
+    return error;
+  }
+  *out = allocator;
+  return NULL;
+}
+
+char *jl_shared_allocator_alloc(jl_shared_allocator *allocator, size_t bytes, void **out) {
+  if (allocator == NULL || out == NULL) return copy("invalid shared allocation");
+  *out = NULL;
+  if (bytes > SIZE_MAX - allocator->total_bytes) return copy("shared allocation byte count overflow");
+  char *error = take(api()->AllocatorAlloc(allocator->allocator, bytes, out));
+  if (error == NULL && *out == NULL) error = copy("QNN shared allocator returned no memory");
+  if (error == NULL) allocator->total_bytes += bytes;
+  return error;
+}
+
+void jl_shared_allocator_free(jl_shared_allocator *allocator, void *data) {
+  if (allocator == NULL || data == NULL) return;
+  char *error = take(api()->AllocatorFree(allocator->allocator, data));
+  if (error != NULL) {
+    fprintf(stderr, "Jetlink QNN shared memory free: %s\n", error);
+    free(error);
+  }
+}
+
+size_t jl_shared_allocator_total_bytes(const jl_shared_allocator *allocator) {
+  return allocator == NULL ? 0 : allocator->total_bytes;
+}
+
 static char *wrap(const OrtMemoryInfo *memory, const jl_tensor *t, OrtValue **out) {
   return take(api()->CreateTensorWithDataAsOrtValue(memory, t->data, t->nbytes, t->dims, t->rank,
                                                     (ONNXTensorElementDataType)t->elem_type, out));
 }
 
 char *jl_binding_create(jl_session *session, const jl_tensor *inputs, size_t n_inputs,
-                        const jl_tensor *outputs, size_t n_outputs, jl_binding **out) {
+                        const jl_tensor *outputs, size_t n_outputs,
+                        const jl_shared_allocator *shared, jl_binding **out) {
   *out = NULL;
+  if (shared != NULL && shared->session != session->session) {
+    // ORT's QNN allocator tracks RPC allocations globally. A second HTP
+    // context can register the same host-accessible allocation. Verify that
+    // this target session really exposes QnnHtpShared; CPU/GPU may not claim it.
+    jl_shared_allocator *compatible = NULL;
+    char *error = jl_shared_allocator_create(session, &compatible);
+    if (error != NULL) return error;
+    jl_shared_allocator_release(compatible);
+  }
   jl_binding *binding = calloc(1, sizeof(jl_binding));
   if (binding == NULL) {
     return copy("out of memory");
@@ -292,8 +394,13 @@ char *jl_binding_create(jl_session *session, const jl_tensor *inputs, size_t n_i
     free(binding);
     return copy("out of memory");
   }
-  OrtMemoryInfo *memory = NULL;
-  char *error = take(api()->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory));
+  OrtMemoryInfo *cpu_memory = NULL;
+  const OrtMemoryInfo *memory = shared != NULL ? shared->memory : NULL;
+  char *error = NULL;
+  if (memory == NULL) {
+    error = take(api()->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_memory));
+    memory = cpu_memory;
+  }
   if (error == NULL) {
     error = take(api()->CreateIoBinding(session->session, &binding->binding));
   }
@@ -311,8 +418,8 @@ char *jl_binding_create(jl_session *session, const jl_tensor *inputs, size_t n_i
       error = take(api()->BindOutput(binding->binding, outputs[i].name, *value));
     }
   }
-  if (memory != NULL) {
-    api()->ReleaseMemoryInfo(memory);
+  if (cpu_memory != NULL) {
+    api()->ReleaseMemoryInfo(cpu_memory);
   }
   if (error != NULL) {
     jl_binding_release(binding);
