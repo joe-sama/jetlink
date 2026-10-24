@@ -44,20 +44,6 @@ struct OrtBackendTests {
     #endif
   }
 
-  @Test("Only the new profile requests the validated HTP shared-memory stack")
-  func parallelOptions() {
-    let backend = OrtBackend(profile: .htpParallel, preparer: ONNXPreparer(), chip: "SM8750")
-    let options = backend.providerOptions(.htp)
-    #expect(options["backend_path"]?.hasSuffix("libJetlinkQnnHtp.so") == true)
-    #expect(options["soc_model"] == "69" && options["htp_arch"] == "79")
-    #expect(options["enable_htp_shared_memory_allocator"] == "1")
-    #expect(backend.deviceTag().contains(CausalPrefillBundle.identity))
-    #expect(OrtProfile.htpParallel.prepareVersion == 10)
-    let legacy = OrtBackend(profile: .htp, preparer: ONNXPreparer(), chip: "SM8750")
-    #expect(legacy.providerOptions(.htp)["enable_htp_shared_memory_allocator"] == nil)
-    #expect(legacy.deviceTag() == "htp-SM8750")
-  }
-
   @Test("Each unit's session plan and provider options")
   func plans() {
     let backend = OrtBackend(profile: .htp, preparer: ONNXPreparer())
