@@ -9,6 +9,8 @@ public struct SessionPlan: Sendable, Equatable {
   /// provider alone.
   public let provider: String?
   public let options: [String: String]
+  /// Per-session configuration, including an explicit fallback contract.
+  public let config: [String: String]
   /// The CPU provider's intra-op pool: 1 where an accelerator does the work.
   public let threads: Int
   /// The session as the log and the hello name it: "CoreML(CPUAndGPU)",
@@ -20,12 +22,13 @@ public struct SessionPlan: Sendable, Equatable {
   public let usesNeuralEngine: Bool
 
   public init(
-    model: URL, provider: String?, options: [String: String] = [:], threads: Int = 1, label: String,
+    model: URL, provider: String?, options: [String: String] = [:], config: [String: String] = [:], threads: Int = 1, label: String,
     usesGPU: Bool = false, usesNeuralEngine: Bool = false
   ) {
     self.model = model
     self.provider = provider
     self.options = options
+    self.config = config
     self.threads = threads
     self.label = label
     self.usesGPU = usesGPU
@@ -72,8 +75,9 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
   public var keepsCPUWarm: Bool { keepWarm != nil || hint != nil }
   public override var notes: String {
     "CPU keep-warm \(keepsCPUWarm ? "on" : "off"); QNN shared I/O \(sharedAllocator == nil ? "off" : "on")"
-      + (schedule == nil ? "" : "; session DAG \(parallelExecution ? "parallel" : "serial control")")
+      + (schedule == nil ? "" : "; session DAG \(parallelExecution ? "parallel" : "serial")")
   }
+  public override var accelerator: String { executedAccelerator }
   public override var coolsWhenIdle: Bool { usesNeuralEngine }
 
   private let chain: [OrtSession]
@@ -86,31 +90,28 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
   private let usesNeuralEngine: Bool
   private let schedule: SessionDAG?
   private let parallelExecution: Bool
-  private var measuredFrames = 0
-  private var stageTotals: [UInt64] = []
-  private var overlapTotal: UInt64 = 0
-  private var trace: [[StageStamp]] = []
+  private let executedAccelerator: String
 
   /// `keepAlive` keeps the GPU clocked up between frames, `keepCPUWarm` the
   /// CPU; each only where a plan runs on that unit.
   public init(
     plans: [SessionPlan], device: String, keepAlive: Bool = true, keepCPUWarm: Bool = true,
-    dataflow: Bool = false, parallel: Bool = true
+    dataflow: Bool = false, parallel: Bool = true, accelerator: String = ""
   ) throws {
     self.device = device
+    self.executedAccelerator = accelerator
     var chain: [OrtSession] = []
     for plan in plans {
-      chain.append(try OrtSession(model: plan.model, provider: plan.provider, options: plan.options, threads: plan.threads))
+      chain.append(try OrtSession(model: plan.model, provider: plan.provider, options: plan.options, config: plan.config, threads: plan.threads))
     }
     self.chain = chain
     self.providers = plans.map(\.label)
     self.schedule = dataflow ? try SessionDAG(inputs: chain.map { $0.inputs.map(\.name) }, outputs: chain.map { $0.outputs.map(\.name) }) : nil
     self.parallelExecution = parallel
-    self.stageTotals = Array(repeating: 0, count: chain.count)
     let sharedSessions = plans.map { $0.options["enable_htp_shared_memory_allocator"] == "1" }
     for (index, enabled) in sharedSessions.enumerated() where enabled {
       guard plans[index].provider == "QNN", plans[index].usesNeuralEngine, !plans[index].usesGPU else {
-        throw OrtError("only verified QNN HTP sessions may bind QNN shared memory")
+        throw OrtError("only QNN HTP sessions may bind QNN shared memory")
       }
     }
     let shared = try sharedSessions.firstIndex(of: true).map { try OrtSharedAllocator(session: chain[$0]) }
@@ -149,7 +150,7 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
     var tensorTypes: [String: TensorSpec] = [:]
     for session in chain {
       for spec in session.inputs + session.outputs {
-        if let previous = tensorTypes[spec.name], previous != spec {
+        if dataflow, let previous = tensorTypes[spec.name], previous != spec {
           throw OrtError("incompatible session tensor \(spec.name)")
         }
         tensorTypes[spec.name] = spec
@@ -193,13 +194,11 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
           // writes the buffer the state_ input reads next run
           return (spec, buffer(input, parity: p ^ 1)!)
         }
-        // RPC buffers are host-accessible. GPU and CPU sessions use ordinary
-        // CPU tensor metadata over those pointers; only HTP contexts register
-        // them as QnnHtpShared. Every context stays alive until all buffers free.
-        set.append(
-          try OrtBinding(
-            session: session, inputs: ins, outputs: outs,
-            sharedAllocator: sharedSessions[index] ? sharedAllocator : nil))
+        // These allocations remain host-accessible. Only HTP sessions label
+        // their bindings QnnHtpShared; CPU/GPU sessions use CPU memory metadata.
+        set.append(try OrtBinding(
+          session: session, inputs: ins, outputs: outs,
+          sharedAllocator: sharedSessions[index] ? sharedAllocator : nil))
       }
       sets.append(set)
     }
@@ -220,22 +219,9 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
 
   public override func execute() throws {
     if let schedule {
-      let times = StageTimings(count: chain.count)
       try schedule.run(parallel: parallelExecution) { index in
-        let start = DispatchTime.now().uptimeNanoseconds
-        defer { times.record(index, start: start, end: DispatchTime.now().uptimeNanoseconds) }
         try self.bindings[self.parity][index].run()
       }
-      let stamps = times.snapshot()
-      measuredFrames += 1
-      for (index, stamp) in stamps.enumerated() { stageTotals[index] += stamp.end - stamp.start }
-      for layer in schedule.layers where layer.count > 1 {
-        let group = layer.map { stamps[$0] }
-        let total = group.reduce(UInt64(0)) { $0 + $1.end - $1.start }
-        let span = group.map(\.end).max()! - group.map(\.start).min()!
-        if total > span { overlapTotal += total - span }
-      }
-      if trace.count < 128 { trace.append(stamps) }
       return
     }
     for binding in bindings[parity] {
@@ -251,37 +237,8 @@ public final class OrtEngine: EngineCore, @unchecked Sendable {
     return "onnxruntime \(OrtRuntime.version) on \(device) in process, sessions \(providers.joined(separator: " then "))\(shared)"
   }
 
-  public override func flushTiming() {
-    guard let schedule, measuredFrames > 0 else { return }
-    let ms = stageTotals.map { Double($0) / Double(measuredFrames) / 1e6 }
-    let overlap = Double(overlapTotal) / Double(measuredFrames) / 1e6
-    ServerLog(category: "parallel").info(
-      "session DAG \(parallelExecution ? "parallel" : "serial"): \(measuredFrames) runs, provider stage means \(ms) ms, mean provider-call overlap \(overlap) ms"
-    )
-    guard let path = ProcessInfo.processInfo.environment["JETLINK_PARALLEL_TRACE"], !path.isEmpty else { return }
-    let payload: [String: Any] = [
-      "device": device, "parallel": parallelExecution, "layers": schedule.layers, "providers": providers,
-      "runs_since_load": measuredFrames, "stage_mean_ms": ms, "mean_provider_call_overlap_ms": overlap,
-      "scope": "Synchronous provider API spans; not accelerator occupancy percentages. Includes warmup and correctness runs since load.",
-      "trace": trace.enumerated().map { frame, stamps in
-        [
-          "frame": frame,
-          "stages": stamps.enumerated().map { index, stamp in
-            ["index": index, "start_ns": stamp.start, "end_ns": stamp.end] as [String: Any]
-          },
-        ] as [String: Any]
-      },
-    ]
-    do {
-      let target = URL(fileURLWithPath: path)
-      try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]).write(to: target, options: .atomic)
-    } catch { ServerLog(category: "parallel").warning("could not save stage trace: \(error)") }
-  }
-
   public override func close() {
     guard !isClosed else { return }
-    flushTiming()
     keepAlive?.close()
     keepWarm?.close()
     hint?.close()

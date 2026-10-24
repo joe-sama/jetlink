@@ -25,7 +25,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
   /// fp16 whatever the graph says, so its fp32 heads are fp16 there too, and
   /// only the parity check can say whether that is close enough.
   case htpWhole = "htp-whole"
-  /// Experimental same-frame (HTP vision || GPU history) -> HTP decode -> CPU join.
+  /// Same-frame causal work: HTP vision and GPU history, then HTP decode.
   case htpParallel = "htp-parallel"
   /// The whole graph on the Adreno GPU.
   case gpu
@@ -67,7 +67,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
     switch self {
     case .ane, .htp: .split
     case .aneWhole, .htpWhole: .aneWhole
-    case .htpParallel: .qnnPrefillBase  // loaded from the verified offline bundle
+    case .htpParallel: .qnnPrefillBase
     case .coreml, .gpu: .whole
     case .cpu:
       #if os(Android)
@@ -81,7 +81,7 @@ public enum OrtProfile: String, CaseIterable, Sendable {
   /// What a build writes: 5 is every graph split on `ane` and Expand as Tile
   /// on both, 6 the plain graph. An artifact prepared under another rebuilds.
   public var prepareVersion: Int {
-    self == .htpParallel ? 10 : (layout == .plain ? 6 : 5)
+    self == .htpParallel ? 11 : (layout == .plain ? 6 : 5)
   }
 
   var usesCoreML: Bool {
@@ -126,8 +126,8 @@ enum OrtUnit: Equatable {
 /// and their manifest (OrtArtifact), CoreML's compiled models or QNN's EP
 /// context beside them.
 ///
-/// The causal-prefill profile has been measured on SM8750 with Cinque V3;
-/// other QNN profiles and hardware keep their existing behavior.
+/// The causal profile uses a model-specific contract and generic QNN provider
+/// discovery. A phone/runtime still needs accuracy and sustained qualification.
 public final class OrtBackend: EngineBackend {
   /// A first NPU compile with no earlier build to go by. The QNN graph
   /// finalization of a big model is minutes on a phone (unmeasured).
@@ -142,29 +142,35 @@ public final class OrtBackend: EngineBackend {
   public let keepAlive: Bool
   /// Keep a CPU core warm while the Neural Engine or the NPU runs a frame.
   public let keepCPUWarm: Bool
+  public let qnn: QnnPolicy
   private let preparer: any ModelPreparer
   private let chip: String
+  private let causalBundle: URL?
   private let log = ServerLog(category: "ort")
 
   /// `chip` names what the artifacts are valid for: on Android the SoC's
   /// model, "SM8650" (Build.SOC_MODEL), which a QNN context is compiled for.
   /// Nil is the Apple chip on Apple platforms and "cpu" elsewhere.
-  public init(profile: OrtProfile, preparer: any ModelPreparer, keepAlive: Bool = true, keepCPUWarm: Bool = true, chip: String? = nil) {
+  public init(
+    profile: OrtProfile, preparer: any ModelPreparer, keepAlive: Bool = true, keepCPUWarm: Bool = true,
+    chip: String? = nil, qnn: QnnPolicy = .init(), causalBundle: URL? = nil
+  ) {
     self.profile = profile
     self.preparer = preparer
     self.keepAlive = keepAlive
     self.keepCPUWarm = keepCPUWarm
     self.chip = HostChip.resolve(chip)
+    self.qnn = profile == .htpParallel ? QnnPolicy(
+      sharedIO: qnn.sharedIO, strict: true, disableAdvancedActivationFusion: qnn.disableAdvancedActivationFusion,
+      libraryDirectory: qnn.libraryDirectory, runtimeIdentity: qnn.runtimeIdentity) : qnn
+    self.causalBundle = causalBundle
   }
 
   public var runtimeVersion: String { OrtRuntime.version }
 
   public func deviceTag() -> String {
-    if profile == .htpParallel {
-      let mode = ProcessInfo.processInfo.environment["JETLINK_PARALLEL_SERIAL"] == "1" ? "serial" : "parallel"
-      return sanitize("htp-parallel-\(chip)-fused4-qairt247-no-fusion-sharedio-\(CausalPrefillBundle.identity)-\(mode)")
-    }
-    return sanitize("\(profile.rawValue)-\(chip)")
+    let contract = profile == .htpParallel ? "-\(CausalPrefillBundle.identity)" : ""
+    return sanitize("\(profile.rawValue)-\(chip)\(contract)\(profile.sessions.contains(where: { $0.unit == .htp }) ? qnn.cacheSuffix : "")")
   }
 
   public func deriveSpec(model: URL, sha256: String, nbytes: Int64, frameSkip: Int) throws -> ModelSpec {
@@ -173,19 +179,9 @@ public final class OrtBackend: EngineBackend {
 
   /// QNN's options for a unit, as onnxruntime 1.29 names them.
   func providerOptions(_ unit: OrtUnit) -> [String: String] {
-    if profile == .htpParallel && unit == .htp {
-      return [
-        "backend_path": (ProcessInfo.processInfo.environment["JETLINK_QNN_LIBRARY_DIR"].map { "\($0)/" } ?? "") + "libJetlinkQnnHtp.so",
-        "soc_model": "69", "htp_arch": "79",
-        "htp_performance_mode": keepAlive ? "burst" : "sustained_high_performance",
-        "htp_graph_finalization_optimization_mode": "3", "enable_htp_fp16_precision": "1",
-        "qnn_context_priority": "high", "enable_htp_shared_memory_allocator": "1",
-      ]
-    }
-    return switch unit {
+    switch unit {
     case .htp:
-      [
-        "backend_type": "htp",
+      var options = qnn.htpBackend.merging([
         // burst holds the clocks up between frames, the counterpart of the
         // Mac's GPU keep-alive; sustained trades speed for less heat.
         "htp_performance_mode": keepAlive ? "burst" : "sustained_high_performance",
@@ -193,9 +189,11 @@ public final class OrtBackend: EngineBackend {
         "htp_graph_finalization_optimization_mode": "3",
         "enable_htp_fp16_precision": "1",
         "qnn_context_priority": "high",
-      ]
-    case .qnnGPU: ["backend_type": "gpu"]
-    case .coreML, .cpu: [:]
+      ]) { _, value in value }
+      if qnn.sharedIO { options["enable_htp_shared_memory_allocator"] = "1" }
+      return options
+    case .qnnGPU: return ["backend_type": "gpu"]
+    case .coreML, .cpu: return [:]
     }
   }
 
@@ -204,8 +202,12 @@ public final class OrtBackend: EngineBackend {
   func plan(_ unit: OrtUnit, model: URL, cache: URL?) -> SessionPlan {
     switch unit {
     case .coreML(let units): SessionPlan(model: model, computeUnits: units, cacheDirectory: cache)
-    case .htp: SessionPlan(model: model, provider: "QNN", options: providerOptions(unit), label: "QNN(htp)", usesNeuralEngine: true)
-    case .qnnGPU: SessionPlan(model: model, provider: "QNN", options: providerOptions(unit), label: "QNN(gpu)", usesGPU: true)
+    case .htp: SessionPlan(
+      model: model, provider: "QNN", options: providerOptions(unit), config: qnn.sessionConfig,
+      label: "QNN(htp)", usesNeuralEngine: true)
+    case .qnnGPU: SessionPlan(
+      model: model, provider: "QNN", options: providerOptions(unit),
+      config: profile == .htpParallel ? qnn.sessionConfig : [:], label: "QNN(gpu)", usesGPU: true)
     case .cpu: SessionPlan(model: model, provider: nil, threads: HostChip.cpuThreads, label: "CPU")
     }
   }
@@ -218,36 +220,55 @@ public final class OrtBackend: EngineBackend {
     }
   }
 
-  /// Fail before compiling or loading on unvalidated hardware/runtime stacks.
-  private func validateParallel() throws {
-    guard profile == .htpParallel else { return }
-    guard chip == "SM8750", OrtRuntime.version == "1.29.0",
-      ProcessInfo.processInfo.environment["JETLINK_QNN_TUNING"] == "no-fusion",
-      ProcessInfo.processInfo.environment["JETLINK_QNN_STRICT"] == "1"
-    else {
-      throw HostError.invalid("causal-prefill requires the opt-in SM8750 / ORT 1.29 / QAIRT 2.47 build; see docs/android-causal-prefill.md")
-    }
+  /// Choose before preparation, not after an arbitrary inference error.
+  func effectiveProfile(for sha256: String) -> OrtProfile {
+    profile == .htpParallel && sha256 != CausalPrefillBundle.sourceSHA ? .htpWhole : profile
+  }
+
+  private func wholeFallback() -> OrtBackend {
+    OrtBackend(profile: .htpWhole, preparer: preparer, keepAlive: keepAlive, keepCPUWarm: keepCPUWarm, chip: chip, qnn: qnn)
+  }
+
+  /// The configured cache remains isolated; the sidecar and engine report the
+  /// route actually used for this model. Unknown/old route metadata rebuilds.
+  func artifactProfile(_ meta: [String: Any]) throws -> OrtProfile {
+    guard let source = meta["causal_prefill_source"] as? String, CacheLayout.isSHA256(source),
+      let route = (meta["causal_prefill_route"] as? String).flatMap(OrtProfile.init(rawValue:)),
+      route == effectiveProfile(for: source)
+    else { throw ArtifactInvalid("causal-prefill artifact has no matching source and execution route") }
+    return route
   }
 
   private func engine(_ artifact: URL, _ manifest: [[String: Any]], keepAlive: Bool, keepCPUWarm: Bool) throws -> OrtEngine {
     try OrtEngine(
       plans: plans(artifact, manifest), device: deviceTag(), keepAlive: keepAlive, keepCPUWarm: keepCPUWarm,
       dataflow: profile == .htpParallel,
-      parallel: ProcessInfo.processInfo.environment["JETLINK_PARALLEL_SERIAL"] != "1")
+      accelerator: profile == .htpParallel ? "NPU + GPU" : (profile == .htpWhole ? "NPU" : ""))
   }
 
   // MARK: build
 
   public func build(model: URL, artifact: URL, report: @escaping ProgressFn, metaExtra: [String: Any]) throws {
-    try validateParallel()
+    try qnn.validate()
+    var extra = metaExtra
+    if profile == .htpParallel {
+      let source = try Registry.hashFile(model).0
+      let route = effectiveProfile(for: source)
+      extra["causal_prefill_source"] = source
+      extra["causal_prefill_route"] = route.rawValue
+      if route == .htpWhole {
+        log.info("this model has no causal split; preparing the existing whole-NPU route")
+        return try wholeFallback().build(model: model, artifact: artifact, report: report, metaExtra: extra)
+      }
+    }
     let started = Date()
     let expect = Artifact.sidecar(artifact)
-    try Artifact.build(artifact, metaExtra: metaExtra, report: report) { staged in
+    try Artifact.build(artifact, metaExtra: extra, report: report) { staged in
       try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
       report("patch", 0, profile.usesCoreML ? "preparing the model for CoreML" : "preparing the model")
       let prepared: PreparedModel
       if profile == .htpParallel {
-        prepared = try CausalPrefillBundle.prepare(model: model, into: staged)
+        prepared = try CausalPrefillBundle.prepare(model: model, into: staged, bundle: causalBundle)
       } else {
         prepared = try preparer.prepare(model: model, into: staged, layout: profile.layout) {
           CoreMLPreparation.cacheKey(stem: artifact.deletingPathExtension().lastPathComponent, part: $0)
@@ -308,12 +329,7 @@ public final class OrtBackend: EngineBackend {
     let context = staged.appending(path: "\(session)_ctx.onnx")
     report("compile", 0, "compiling \(session) for the NPU")
     try Ticker.during(interval: 2, Ticker.paced("compile", "compiling \(session) for the NPU", took: took, report: report)) {
-      let config = [
-        "ep.context_enable": "1",
-        "ep.context_file_path": context.path,
-        // the context binary in a file of its own beside the model, not base64 inside it
-        "ep.context_embed_mode": "0",
-      ]
+      let config = contextConfiguration(context: context)
       _ = try OrtSession(model: source, provider: "QNN", options: providerOptions(.htp), config: config)
     }
     guard FileManager.default.fileExists(atPath: context.path) else {
@@ -322,6 +338,16 @@ public final class OrtBackend: EngineBackend {
     }
     try? FileManager.default.removeItem(at: source)
     return context.lastPathComponent
+  }
+
+  /// The same strict provider contract applies during compilation and reload.
+  func contextConfiguration(context: URL) -> [String: String] {
+    qnn.sessionConfig.merging([
+        "ep.context_enable": "1",
+        "ep.context_file_path": context.path,
+        // the context binary in a file of its own beside the model, not base64 inside it
+        "ep.context_embed_mode": "0",
+    ]) { _, value in value }
   }
 
   /// A CoreML build's first session creation is the conversion and CoreML's
@@ -367,7 +393,15 @@ public final class OrtBackend: EngineBackend {
   // MARK: load
 
   public func load(artifact: URL, report: @escaping ProgressFn) throws -> any Engine {
-    try validateParallel()
+    try qnn.validate()
+    if profile == .htpParallel, try artifactProfile(Artifact.sidecar(artifact)) == .htpWhole {
+      let (manifest, _) = try OrtArtifact.open(artifact, version: OrtProfile.htpWhole.prepareVersion)
+      guard manifest.count == 1, OrtUnit(entry: manifest[0]) == .htp,
+        ["model.onnx", "model_ctx.onnx"].contains(manifest[0]["model"] as? String ?? "") else {
+        throw ArtifactInvalid("causal-prefill fallback artifact is not the whole-NPU route")
+      }
+      return try wholeFallback().load(artifact: artifact, report: report)
+    }
     let (manifest, meta) = try OrtArtifact.open(artifact, version: profile.prepareVersion) { entry in
       guard let unit = OrtUnit(entry: entry) else { return "a session names no unit" }
       // Without its compile, onnxruntime would recompile under a "loading"
@@ -377,6 +411,16 @@ public final class OrtBackend: EngineBackend {
       guard case .coreML = unit, let cache = entry["cache"] as? String else { return nil }
       let contents = (try? FileManager.default.contentsOfDirectory(atPath: artifact.appending(path: cache, directoryHint: .isDirectory).path)) ?? []
       return contents.isEmpty ? "the CoreML cache for \(entry["model"] as? String ?? cache) is empty" : nil
+    }
+    if profile == .htpParallel {
+      guard manifest.count == 4,
+        manifest.compactMap(OrtUnit.init(entry:)) == [.htp, .qnnGPU, .htp, .cpu],
+        zip(manifest, ["vision", "history", "decode", "join"]).allSatisfy({ entry, name in
+          let file = entry["model"] as? String
+          return file == "\(name).onnx" || ((name == "vision" || name == "decode") && file == "\(name)_ctx.onnx")
+        })
+      else { throw ArtifactInvalid("causal-prefill artifact has a different session contract") }
+      try CausalPrefillBundle.verifyRetainedParts(in: artifact)
     }
     let what = profile.usesCoreML ? "the CoreML model" : "the model"
     let (engine, seconds) = try Artifact.load(artifact, meta: meta, what: what, report: report) {

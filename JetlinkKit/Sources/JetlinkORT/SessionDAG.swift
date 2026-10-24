@@ -31,8 +31,8 @@ struct SessionDAG: Sendable {
     for layer in layers {
       if parallel && layer.count > 1 {
         let failure = FirstFailure()
-        // concurrentPerform returns only after every branch has completed,
-        // including when one failed. No tensor can be freed or reused early.
+        // Join every branch, including after failure, before state can advance
+        // or any shared tensor can be freed or reused.
         DispatchQueue.concurrentPerform(iterations: layer.count) { offset in
           do { try stage(layer[offset]) } catch { failure.store(error) }
         }
@@ -56,26 +56,5 @@ private final class FirstFailure: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return value
-  }
-}
-
-struct StageStamp: Sendable {
-  let start: UInt64
-  let end: UInt64
-}
-
-final class StageTimings: @unchecked Sendable {
-  private let lock = NSLock()
-  private var values: [StageStamp?]
-  init(count: Int) { values = Array(repeating: nil, count: count) }
-  func record(_ index: Int, start: UInt64, end: UInt64) {
-    lock.lock()
-    values[index] = StageStamp(start: start, end: end)
-    lock.unlock()
-  }
-  func snapshot() -> [StageStamp] {
-    lock.lock()
-    defer { lock.unlock() }
-    return values.compactMap { $0 }
   }
 }
