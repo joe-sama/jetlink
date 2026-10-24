@@ -23,9 +23,21 @@ parser.add_argument("--model", type=Path, required=True, help="original Cinque V
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--base-tool", type=Path, required=True, help="built jetlink-prefill-base executable")
 args = parser.parse_args()
+if not __debug__:
+  parser.error("Python -O disables the model-contract assertions; run without -O")
+
+
+def sha256(path):
+  digest = hashlib.sha256()
+  with path.open('rb') as stream:
+    for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+      digest.update(block)
+  return digest.hexdigest()
+
+
 assert onnx.__version__ == "1.23.2", "reproduction is pinned to onnx==1.23.2"
 assert np.__version__ == "2.5.4", "reproduction is pinned to numpy==2.5.4"
-assert hashlib.sha256(args.model.read_bytes()).hexdigest() == "404a18cfd86d29637d20c697dfde245bb47c666ae016730ab674c65f4d1e1aa4", (
+assert sha256(args.model) == "404a18cfd86d29637d20c697dfde245bb47c666ae016730ab674c65f4d1e1aa4", (
   "only the validated Cinque V3 export is supported"
 )
 OUT = args.out.resolve()
@@ -34,7 +46,7 @@ assert not any(OUT.iterdir()), "choose an empty output directory"
 temporary = tempfile.TemporaryDirectory(prefix="jetlink-prefill-base-")
 source = Path(temporary.name) / "model.onnx"
 subprocess.run([str(args.base_tool.resolve()), str(args.model.resolve()), temporary.name], check=True)
-assert hashlib.sha256(source.read_bytes()).hexdigest() == "4ef3b6f248bf8d3ae0e1f76cfd0d5fcc4f079b6d910f735bd4cc22172b0d0166", (
+assert sha256(source) == "4ef3b6f248bf8d3ae0e1f76cfd0d5fcc4f079b6d910f735bd4cc22172b0d0166", (
   "base graph differs from the phone-validated graph"
 )
 m = onnx.load(source)
@@ -251,11 +263,10 @@ for name, part, unit in models:
     'weight_bytes': sum(len(t.raw_data) for t in part.graph.initializer),
     'inputs': [v.name for v in part.graph.input],
     'outputs': [v.name for v in part.graph.output],
-    'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+    'sha256': sha256(path),
   }
   records.append(record)
   print(json.dumps(record), flush=True)
-(OUT / 'plan.json').write_text(json.dumps(records, indent=2))
 (OUT / 'manifest.json').write_text(
   json.dumps(
     {
@@ -270,7 +281,6 @@ for name, part, unit in models:
 )
 print('Saved exact same-frame (vision || history) -> decode -> join.', flush=True)
 
-expected = json.loads(Path(__file__).with_name("causal-prefill-manifest.json").read_text())
 assert (OUT / "manifest.json").read_bytes() == Path(__file__).with_name("causal-prefill-manifest.json").read_bytes(), (
   "generated bundle differs from the validated bundle"
 )
