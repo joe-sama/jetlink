@@ -16,7 +16,6 @@ struct jl_env {
 
 struct jl_session {
   OrtSession *session;
-  int profiling;
 };
 
 struct jl_binding {
@@ -166,23 +165,6 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
   for (size_t i = 0; error == NULL && i < n_config; i++) {
     error = take(api()->AddSessionConfigEntry(so, config[i].key, config[i].value));
   }
-  const char *profile = getenv("JETLINK_ORT_PROFILE");
-  if (error == NULL && profile != NULL && profile[0] != '\0') {
-    char path[4096];
-    snprintf(path, sizeof(path), "%s-ort-%p", profile, (void *)so);
-    error = take(api()->EnableProfiling(so, path));
-  }
-  if (error == NULL && provider != NULL && strcmp(provider, "QNN") == 0 && getenv("JETLINK_QNN_STRICT") != NULL) {
-    for (size_t i = 0; i < n_options; i++) {
-      if ((strcmp(options[i].key, "backend_type") == 0 &&
-           (strcmp(options[i].value, "htp") == 0 || strcmp(options[i].value, "gpu") == 0)) ||
-          (strcmp(options[i].key, "backend_path") == 0 && strstr(options[i].value, "libJetlinkQnnHtp.so") != NULL)) {
-        // A heterogeneous test must fail if either accelerator leaves compute on the CPU.
-        error = take(api()->AddSessionConfigEntry(so, "session.disable_cpu_ep_fallback", "1"));
-        break;
-      }
-    }
-  }
   if (error == NULL && provider != NULL) {
     const char **keys = calloc(n_options + 1, sizeof(char *));
     const char **values = calloc(n_options + 1, sizeof(char *));
@@ -207,7 +189,6 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
   }
   if (error == NULL) {
     error = take(api()->CreateSession(env->env, model_path, so, &session->session));
-    session->profiling = profile != NULL && profile[0] != '\0';
   }
   api()->ReleaseSessionOptions(so);
   if (error != NULL) {
@@ -221,19 +202,6 @@ char *jl_session_create(jl_env *env, const char *model_path, const char *provide
 void jl_session_release(jl_session *session) {
   if (session == NULL) {
     return;
-  }
-  if (session->profiling) {
-    OrtAllocator *allocator = NULL;
-    char *filename = NULL;
-    OrtStatus *status = api()->GetAllocatorWithDefaultOptions(&allocator);
-    if (status == NULL) {
-      free(take(api()->SessionEndProfiling(session->session, allocator, &filename)));
-      if (filename != NULL) {
-        free(take(api()->AllocatorFree(allocator, filename)));
-      }
-    } else {
-      free(take(status));
-    }
   }
   api()->ReleaseSession(session->session);
   free(session);
