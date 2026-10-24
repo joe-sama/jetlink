@@ -22,24 +22,46 @@ val jetlinkVersionCode: Int =
     jetlinkVersion.split(".").map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
         .let { (it.getOrElse(0) { 0 } * 10000) + (it.getOrElse(1) { 0 } * 100) + it.getOrElse(2) { 0 } }
 
-// Explicit build opt-in: standard releases still package the Maven QNN runtime.
-val causalPrefill = providers.gradleProperty("jetlink.causalPrefill").orNull == "true"
-val qairtJniDir = providers.gradleProperty("jetlink.qairtJniDir").orNull
-if (causalPrefill) {
-    check(qairtJniDir != null) { "causal-prefill needs the matched QAIRT 2.47 jniLibs; see docs/android-causal-prefill.md" }
-    @Suppress("UNCHECKED_CAST")
-    val matched = groovy.json.JsonSlurper().parse(rootDir.resolve("qnn/qairt-2.47-sha256.json")) as Map<String, String>
-    for ((name, expected) in matched) {
-        val library = File(qairtJniDir, "arm64-v8a/$name")
-        check(library.isFile) { "missing QAIRT 2.47 library: $name" }
-        val actual = MessageDigest.getInstance("SHA-256").digest(library.readBytes()).joinToString("") { "%02x".format(it) }
-        check(actual == expected) { "$name differs from the validated QAIRT 2.47 stack" }
+// All options are build-time opt-ins; ordinary releases retain the Maven runtime.
+fun qnnFlag(name: String): Boolean = providers.gradleProperty(name).orNull?.let {
+    it.toBooleanStrictOrNull() ?: error("$name must be true or false")
+} ?: false
+val qnnSharedIO = qnnFlag("jetlink.qnnSharedIO")
+val causalPrefill = qnnFlag("jetlink.causalPrefill")
+val qnnStrict = qnnFlag("jetlink.qnnStrict")
+val qnnNoActivationFusion = qnnFlag("jetlink.qnnNoActivationFusion")
+val qnnJniDir = providers.gradleProperty("jetlink.qnnJniDir").orNull
+val qnnJniRoot = qnnJniDir?.let { file(it) }
+val qnnRuntimeIdentity = if (qnnNoActivationFusion) {
+    check(qnnJniDir != null) { "no-fusion requires one matching SDK; see docs/android-qnn-npu.md" }
+    val directory = File(qnnJniRoot!!, "arm64-v8a")
+    val libraries = directory.listFiles()?.filter { it.isFile && it.extension == "so" }?.sortedBy { it.name }.orEmpty()
+    val names = libraries.map { it.name }.toSet()
+    check(names.containsAll(listOf("libJetlinkQnnHtpNoFusion.so", "libQnnHtp.so", "libQnnGpu.so", "libQnnSystem.so",
+        "libQnnHtpPrepare.so", "libQnnIr.so", "libQnnSaver.so"))) { "incomplete SDK jniLibs directory: $directory" }
+    val stub = names.filter { it.matches(Regex("libQnnHtpV\\d+Stub\\.so")) }.map { it.removeSuffix("Stub.so") }.toSet()
+    val skel = names.filter { it.matches(Regex("libQnnHtpV\\d+Skel\\.so")) }.map { it.removeSuffix("Skel.so") }.toSet()
+    check(stub.isNotEmpty() && stub == skel) { "matching HTP stub/skel pairs are required" }
+    // Actual runtime bytes form a cache namespace, not a preselected SDK/SoC pin.
+    val identity = MessageDigest.getInstance("SHA-256")
+    for (library in libraries) {
+        val digest = MessageDigest.getInstance("SHA-256")
+        library.inputStream().use { stream ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        identity.update(library.name.toByteArray(Charsets.UTF_8))
+        identity.update(0.toByte())
+        identity.update(digest.digest())
     }
-    for (name in listOf("libJetlinkQnnHtp.so", "libQnnHtp.so", "libQnnGpu.so", "libQnnHtpV79Stub.so", "libQnnHtpV79Skel.so")) {
-        check(File(qairtJniDir, "arm64-v8a/$name").isFile) { "missing matched library: $name" }
-    }
+    identity.digest().joinToString("") { "%02x".format(it) }
 } else {
-    check(qairtJniDir == null) { "jetlink.qairtJniDir is only supported with jetlink.causalPrefill=true" }
+    check(qnnJniDir == null) { "jetlink.qnnJniDir requires jetlink.qnnNoActivationFusion=true" }
+    ""
 }
 
 android {
@@ -57,6 +79,10 @@ android {
         versionCode = jetlinkVersionCode
         versionName = jetlinkVersion
         buildConfigField("boolean", "EXPERIMENTAL_CAUSAL_PREFILL", causalPrefill.toString())
+        buildConfigField("boolean", "QNN_SHARED_IO", qnnSharedIO.toString())
+        buildConfigField("boolean", "QNN_STRICT", qnnStrict.toString())
+        buildConfigField("boolean", "QNN_NO_ACTIVATION_FUSION", qnnNoActivationFusion.toString())
+        buildConfigField("String", "QNN_RUNTIME_IDENTITY", "\"$qnnRuntimeIdentity\"")
         // The QNN runtime is arm64 only, and so is every Snapdragon with an NPU
         // worth driving on. The emulator on an Apple silicon Mac is arm64 too.
         ndk { abiFilters += "arm64-v8a" }
@@ -105,7 +131,7 @@ android {
         }
     }
 
-    if (causalPrefill) sourceSets.getByName("main").jniLibs.srcDir(qairtJniDir!!)
+    if (qnnNoActivationFusion) sourceSets.getByName("main").jniLibs.srcDir(qnnJniRoot!!)
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -156,7 +182,7 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     // libonnxruntime.so with the QNN provider, and the QNN runtime's libraries
     implementation(libs.onnxruntime.qnn) {
-        if (causalPrefill) exclude(group = "com.qualcomm.qti", module = "qnn-runtime")
+        if (qnnNoActivationFusion) exclude(group = "com.qualcomm.qti", module = "qnn-runtime")
     }
     debugImplementation(libs.compose.ui.tooling)
 
