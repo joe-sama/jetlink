@@ -21,15 +21,6 @@ class ProcessorTest {
     }
 
     @Test
-    fun parallelNeedsExplicitOptIn() {
-        assertFalse(Processor.NpuGpuParallel in Processor.choices(true, false, false, Processor.Auto))
-        assertTrue(Processor.NpuGpuParallel in Processor.choices(true, false, false, Processor.Auto, parallel = true))
-        assertFalse(Processor.NpuGpuParallel in Processor.choices(false, true, false, Processor.Auto, parallel = true))
-        assertEquals(Processor.NpuGpuParallel, Processor.of("htp-parallel"))
-        assertEquals(Processor.NpuGpu, Processor.of("htp"))
-    }
-
-    @Test
     fun aGoogleTensorOffersItsNpu() {
         assertEquals(
             listOf(Processor.Auto, Processor.TensorNpu, Processor.Gpu, Processor.Cpu),
@@ -87,7 +78,8 @@ class ProcessorTest {
 
     @Test
     fun theEmulatorOffersEverything() {
-        assertEquals(Processor.entries, Processor.choices(qualcomm = false, tensorNpu = false, emulator = true, current = Processor.Cpu))
+        assertEquals(Processor.entries.filter { it != Processor.NpuGpuParallel }, Processor.choices(false, false, true, Processor.Cpu))
+        assertEquals(Processor.entries, Processor.choices(false, false, true, Processor.Cpu, parallel = true))
     }
 
     @Test
@@ -118,5 +110,16 @@ class ProcessorTest {
         assertEquals(3, Chip.tensorGeneration("Tensor G3"))
         assertEquals(null, Chip.tensorGeneration("SM8650"))
         assertEquals(null, Chip.tensorGeneration("Tensor"))
+    }
+
+    @Test
+    fun theParallelExperimentIsBuildOptInForQualcommAndReportsItsFallback() {
+        assertFalse(Processor.choices(true, false, false, Processor.Npu).contains(Processor.NpuGpuParallel))
+        assertTrue(Processor.choices(true, false, false, Processor.Npu, parallel = true).contains(Processor.NpuGpuParallel))
+        assertFalse(Processor.choices(false, true, false, Processor.TensorNpu, parallel = true).contains(Processor.NpuGpuParallel))
+        assertEquals(Processor.NpuGpuParallel, Processor.of("htp-parallel"))
+        assertTrue(Processor.NpuGpuParallel.fellBack("NPU", automatic = Processor.Gpu))
+        assertFalse(Processor.NpuGpuParallel.fellBack("NPU + GPU", automatic = Processor.Gpu))
+        assertEquals("NPU + GPU (experimental) (NPU)", Processor.NpuGpuParallel.summary("NPU", automatic = Processor.Gpu))
     }
 }
